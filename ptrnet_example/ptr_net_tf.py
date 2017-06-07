@@ -1,8 +1,10 @@
 import tensorflow as tf
-from tensorflow.contrib.layers import xavier_initializer as xinit
+#from tensorflow.contrib.layers import xavier_initializer as xinit
 
 from recurrence import *
 from train import *
+
+from tqdm import tqdm
 
 class PointerNet():
 
@@ -14,7 +16,11 @@ class PointerNet():
         self.num_indices = num_indices
         self.hdim = hdim
 
+
         tf.reset_default_graph()
+
+        self.init = tf.random_normal_initializer(0.0, 0.5)
+
         self.inputs = tf.placeholder(tf.float32, name='inputs', shape=[B,L])
         self.targets = tf.placeholder(tf.float32, name='targets', 
                                          shape=[num_indices, B, L])
@@ -25,14 +31,21 @@ class PointerNet():
 
         with tf.variable_scope('decoder'):
             # decoder -> decoder outputs, logits
-            dec_outputs, logits = self.pointer_decoder(estates) 
+            dec_outputs, probs = self.pointer_decoder(estates, as_prob=True) 
+
+        '''
+            we are forsaking cross entropy right now
 
         # cross entropy
         ce = tf.nn.softmax_cross_entropy_with_logits(
                                 logits=logits, labels=self.targets, 
                                 name='cross_entropy')
-        self.loss = tf.reduce_mean(ce, name='loss')
+        '''
 
+        #self.loss = tf.sqrt(tf.reduce_mean(tf.pow(probs - self.targets, 2.0)))
+
+        self.loss = tf.sqrt(tf.reduce_mean(tf.pow(probs - self.targets, 2.0)))
+        
         # optimization
         optimizer = tf.train.AdagradOptimizer(learning_rate=lr)
         self.train_op = optimizer.minimize(self.loss)
@@ -53,8 +66,8 @@ class PointerNet():
             input_ = inputs[:, i:i+1]
 
             # project input [B, 1] -> [B, hdim]
-            We = tf.get_variable('W_e', [1, self.hdim], initializer=xinit())
-            be = tf.get_variable('b_e', [self.hdim], initializer=xinit())
+            We = tf.get_variable('W_e', [1, self.hdim], initializer=self.init)
+            be = tf.get_variable('b_e', [self.hdim], initializer=self.init)
             input_ = tf.nn.elu(tf.matmul(input_, We) + be, name='cell_input')
 
             # step
@@ -63,7 +76,7 @@ class PointerNet():
 
         return estates[1:]
 
-    def pointer_decoder(self, estates):
+    def pointer_decoder(self, estates, as_prob=False):
         # special generation symbol
         special_sym_value = 20.
         special_sym = tf.constant(special_sym_value, shape=[self.B,1], dtype=tf.float32)
@@ -77,14 +90,15 @@ class PointerNet():
         dcell = gru(self.hdim)
 
         logits = []
+        probs = []
         dec_outputs = []
         for i in range(self.num_indices):
             if i>0:
                 tf.get_variable_scope().reuse_variables()
                 
             # project input
-            Wp = tf.get_variable('W_p', [1, self.hdim], initializer=xinit())
-            bp = tf.get_variable('b_p', [self.hdim], initializer=xinit())
+            Wp = tf.get_variable('W_p', [1, self.hdim], initializer=self.init)
+            bp = tf.get_variable('b_p', [self.hdim], initializer=self.init)
             
             d_input_ = tf.nn.elu(tf.matmul(d_input_, Wp) + bp, name='decoder_cell_input')
             
@@ -92,17 +106,17 @@ class PointerNet():
             output, dec_state = dcell(d_input_, dstates[-1])
             
             # project enc/dec states
-            W1 = tf.get_variable('W_1', [self.hdim, self.hdim], initializer=xinit())
-            W2 = tf.get_variable('W_2', [self.hdim, self.hdim], initializer=xinit())
-            ptr_bias = tf.get_variable('ptr_bias', [self.hdim], initializer=xinit())
-            v = tf.get_variable('v', [self.hdim, 1], initializer=xinit())
+            W1 = tf.get_variable('W_1', [self.hdim, self.hdim], initializer=self.init)
+            W2 = tf.get_variable('W_2', [self.hdim, self.hdim], initializer=self.init)
+            ptr_bias = tf.get_variable('ptr_bias', [self.hdim], initializer=self.init)
+            v = tf.get_variable('v', [self.hdim, 1], initializer=self.init)
             
             scores = ptr_attention(estates, dec_state,
                           params = {'Wa' : W1, 'Ua' : W2, 'Va' : v},
                           d = self.hdim, timesteps=self.L)
             
-            probs = tf.nn.softmax(scores)
-            idx = tf.argmax(probs, axis=1)
+            prob_dist = tf.nn.softmax(scores)
+            idx = tf.argmax(prob_dist, axis=1)
             
             # get input at index "idx"
             dec_output_i = self.batch_gather_nd(self.inputs, idx)
@@ -111,9 +125,14 @@ class PointerNet():
             d_input_ = tf.expand_dims(dec_output_i, axis=-1)
             
             logits.append(scores)
-            dec_outputs.append(dec_output_i)
+            probs.append(prob_dist)
 
-        return dec_outputs, logits
+            dec_outputs.append(dec_output_i)
+        
+        if as_prob:
+            return dec_outputs, tf.stack(probs)
+
+        return dec_outputs, tf.stack(logits)
 
 
     def batch_gather_nd(self, t, idx):
@@ -123,29 +142,37 @@ class PointerNet():
         return tf.gather_nd(t, idx_pair)
 
 
-    def train(self, epochs, batch_size):
-
-        num_batches = 1000
+    def train(self, epochs, num_batches,  batch_size, reset_params):
 
         # fetch trainset
         trainset = generate_trainset(num_batches=num_batches, 
                         batch_size=batch_size, maxlen=self.L) 
 
+        max_retries = 20
+        for k in range(max_retries):
 
-        for i in range(epochs):
+            self.sess.run(tf.global_variables_initializer())
+            tf.set_random_seed(1)
 
-            avg_loss = 0
-            for j in range(num_batches):
-                _, l = self.sess.run([self.train_op, self.loss], feed_dict = {
-                            self.inputs : trainset[j][0],
-                            self.targets : trainset[j][1]
-                        })
-                avg_loss += l
+            for i in range(epochs):
 
-            print(i, avg_loss/num_batches)
+                avg_loss = 0
+                for j in tqdm(range(num_batches)):
+                    _, l = self.sess.run([self.train_op, self.loss], feed_dict = {
+                                self.inputs : trainset[j][0],
+                                self.targets : trainset[j][1]
+                            })
+                    avg_loss += l
 
+                tqdm.write('{} : {}'.format(i, avg_loss/num_batches))
+
+                if  i>reset_params['steps'] and avg_loss > reset_params['loss']:
+                    break
 
 if __name__ == '__main__':
-    batch_size = 16
+    batch_size = 1
+    reset_params = {"steps": 30, "loss": .11}
+
     ptrnet = PointerNet(L=60, B=batch_size) 
-    ptrnet.train(epochs=4000, batch_size=batch_size)
+    ptrnet.train(epochs=4000, num_batches= 1024, batch_size=batch_size,
+                    reset_params=reset_params)

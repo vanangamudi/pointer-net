@@ -34,7 +34,7 @@ class PointerNet():
             dec_outputs, probs = self.pointer_decoder(estates, as_prob=True) 
 
         '''
-            we are forsaking cross entropy right now
+            we are forsaking cross entropy for now
 
         # cross entropy
         ce = tf.nn.softmax_cross_entropy_with_logits(
@@ -42,10 +42,10 @@ class PointerNet():
                                 name='cross_entropy')
         '''
 
-        #self.loss = tf.sqrt(tf.reduce_mean(tf.pow(probs - self.targets, 2.0)))
+        # self.loss = tf.sqrt(tf.reduce_mean(tf.pow(probs - self.targets, 2.0)))
 
-        self.loss = tf.sqrt(tf.reduce_mean(tf.pow(probs - self.targets, 2.0)))
-        
+        self.loss = tf.losses.mean_squared_error(labels=self.targets, predictions=probs)
+
         # optimization
         optimizer = tf.train.AdagradOptimizer(learning_rate=lr)
         self.train_op = optimizer.minimize(self.loss)

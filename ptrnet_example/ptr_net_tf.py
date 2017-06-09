@@ -43,8 +43,10 @@ class PointerNet():
         '''
 
         # self.loss = tf.sqrt(tf.reduce_mean(tf.pow(probs - self.targets, 2.0)))
-
-        self.loss = tf.losses.mean_squared_error(labels=self.targets, predictions=probs)
+        inputs_reshaped = tf.stack([self.inputs, self.inputs])
+        padding_mask = tf.cast(inputs_reshaped > 0, tf.float32)
+        self.loss = tf.losses.mean_squared_error(labels=self.targets, 
+                        predictions=probs, weights=padding_mask)
 
         # optimization
         optimizer = tf.train.AdagradOptimizer(learning_rate=lr)

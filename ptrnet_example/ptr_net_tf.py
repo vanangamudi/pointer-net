@@ -6,10 +6,11 @@ from train import *
 
 from tqdm import tqdm
 
+
 class PointerNet():
 
-    def __init__(self, L=10, B=32, num_indices=2, 
-                hdim=10, lr=.9):
+    def __init__(self, L, B, num_indices=2, 
+                hdim=20, lr=1.):
 
         self.L = L
         self.B = B
@@ -19,7 +20,7 @@ class PointerNet():
 
         tf.reset_default_graph()
 
-        self.init = tf.random_normal_initializer(0.0, 0.5)
+        self.init = tf.random_uniform_initializer(-0.08, 0.08)
 
         self.inputs = tf.placeholder(tf.float32, name='inputs', shape=[B,L])
         self.targets = tf.placeholder(tf.float32, name='targets', 
@@ -31,26 +32,38 @@ class PointerNet():
 
         with tf.variable_scope('decoder'):
             # decoder -> decoder outputs, logits
-            dec_outputs, probs = self.pointer_decoder(estates, as_prob=True) 
+            #dec_outputs, logits = self.pointer_decoder(estates)
+            dec_outputs, probs = self.pointer_decoder(estates, as_prob=True, feed_previous=True)
 
-        '''
-            we are forsaking cross entropy for now
 
-        # cross entropy
-        ce = tf.nn.softmax_cross_entropy_with_logits(
-                                logits=logits, labels=self.targets, 
-                                name='cross_entropy')
-        '''
-
-        # self.loss = tf.sqrt(tf.reduce_mean(tf.pow(probs - self.targets, 2.0)))
         inputs_reshaped = tf.stack([self.inputs, self.inputs])
         padding_mask = tf.cast(inputs_reshaped > 0, tf.float32)
+
+        '''
+        # cross entropy
+        ce = tf.nn.softmax_cross_entropy_with_logits(
+                                logits=logits * padding_mask, labels=self.targets, 
+                                name='cross_entropy') # * padding_mask
+
+        self.loss = tf.reduce_mean(ce)
+
+        '''
+        # self.loss = tf.sqrt(tf.reduce_mean(tf.pow(probs - self.targets, 2.0)))
+
         self.loss = tf.losses.mean_squared_error(labels=self.targets, 
-                        predictions=probs, weights=padding_mask)
+                               predictions=probs, weights=padding_mask)
+
+        # accuracy
+        correct_labels = tf.equal(tf.argmax(probs, axis=-1), tf.argmax(self.targets, axis=-1))
+        self.accuracy = tf.reduce_mean(tf.cast(correct_labels, dtype=tf.float32))
 
         # optimization
         optimizer = tf.train.AdagradOptimizer(learning_rate=lr)
-        self.train_op = optimizer.minimize(self.loss)
+        # gradient clipping
+        gvs = optimizer.compute_gradients(self.loss)
+        clipped_gvs = [(tf.clip_by_norm(grad, 2.), var) for grad, var in gvs]
+        self.train_op = optimizer.apply_gradients(clipped_gvs)
+
 
         # init session
         self.sess = tf.Session()
@@ -78,7 +91,7 @@ class PointerNet():
 
         return estates[1:]
 
-    def pointer_decoder(self, estates, as_prob=False):
+    def pointer_decoder(self, estates, as_prob=False, feed_previous=False):
         # special generation symbol
         special_sym_value = 20.
         special_sym = tf.constant(special_sym_value, shape=[self.B,1], dtype=tf.float32)
@@ -110,12 +123,11 @@ class PointerNet():
             # project enc/dec states
             W1 = tf.get_variable('W_1', [self.hdim, self.hdim], initializer=self.init)
             W2 = tf.get_variable('W_2', [self.hdim, self.hdim], initializer=self.init)
-            ptr_bias = tf.get_variable('ptr_bias', [self.hdim], initializer=self.init)
             v = tf.get_variable('v', [self.hdim, 1], initializer=self.init)
             
-            scores = ptr_attention(estates, dec_state,
-                          params = {'Wa' : W1, 'Ua' : W2, 'Va' : v},
-                          d = self.hdim, timesteps=self.L)
+            # pass encoder states as batch_major
+            scores = ptr_attention(tf.transpose(estates, [1,0,2]), dec_state,
+                          params = {'Wa' : W1, 'Ua' : W2, 'Va' : v}, d = self.hdim, timesteps=self.L)
             
             prob_dist = tf.nn.softmax(scores)
             idx = tf.argmax(prob_dist, axis=1)
@@ -123,8 +135,12 @@ class PointerNet():
             # get input at index "idx"
             dec_output_i = self.batch_gather_nd(self.inputs, idx)
             
-            # output at i is input to i+1
-            d_input_ = tf.expand_dims(dec_output_i, axis=-1)
+            if feed_previous:
+                # output at i is input to i+1
+                d_input_ = tf.expand_dims(dec_output_i, axis=-1)
+            else:
+                idx = tf.argmax(self.targets[i], axis=1)
+                d_input_ = tf.expand_dims(self.batch_gather_nd(self.inputs, idx), axis=-1)
             
             logits.append(scores)
             probs.append(prob_dist)
@@ -146,12 +162,14 @@ class PointerNet():
 
     def train(self, epochs, num_batches,  batch_size, reset_params):
 
-        # fetch trainset
-        trainset = generate_trainset(num_batches=num_batches, 
-                        batch_size=batch_size, maxlen=self.L) 
-
         max_retries = 20
         for k in range(max_retries):
+
+            # fetch trainset
+            trainset = generate_trainset(num_batches=num_batches, 
+                            batch_size=batch_size, maxlen=self.L) 
+            testset  = generate_trainset(num_batches=100, 
+                            batch_size=batch_size, maxlen=self.L)
 
             self.sess.run(tf.global_variables_initializer())
             tf.set_random_seed(1)
@@ -166,15 +184,33 @@ class PointerNet():
                             })
                     avg_loss += l
 
-                tqdm.write('{} : {}'.format(i, avg_loss/num_batches))
+                acc = self.evaluate(testset)
+
+                tqdm.write('{} : {}, {}'.format(i, avg_loss/num_batches, acc))
 
                 if  i>reset_params['steps'] and avg_loss > reset_params['loss']:
                     break
 
+    def evaluate(self, testset):
+
+        num_batches = len(testset)
+        avg_acc = 0.
+        for j in range(len(testset)):
+            a = self.sess.run(self.accuracy, feed_dict = {
+                self.inputs : testset[j][0],
+                self.targets : testset[j][1]
+                })
+            avg_acc += a
+
+        return avg_acc/num_batches
+
+
+
+
 if __name__ == '__main__':
-    batch_size = 1
+    batch_size = 8
     reset_params = {"steps": 30, "loss": .11}
 
-    ptrnet = PointerNet(L=60, B=batch_size) 
-    ptrnet.train(epochs=4000, num_batches= 1024, batch_size=batch_size,
+    ptrnet = PointerNet(L=60, B=batch_size)
+    ptrnet.train(epochs=4000, num_batches= 1000, batch_size=batch_size,
                     reset_params=reset_params)
